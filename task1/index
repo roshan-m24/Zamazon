@@ -1,0 +1,12 @@
+// index.js
+// Entry point: starts the HTTP server.
+
+require('dotenv').config();
+const createApp = require('./src/app');
+
+const PORT = process.env.PORT || 3000;
+const app = createApp();
+
+app.listen(PORT, () => {
+  console.log(`Identity Reconciliation service listening on port ${PORT}`);
+});
