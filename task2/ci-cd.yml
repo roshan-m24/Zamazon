@@ -1,0 +1,125 @@
+name: CI/CD - Product Catalogue Microservice
+
+# Triggers:
+#  - Every push/PR to main: run tests (CI).
+#  - Every pushed tag matching v*.*.* : build+push image, deploy to k8s, run
+#    post-deploy integration tests (CD). This lines up with the semantic
+#    version tags (v1.0.0, v1.1.0, v2.0.0) created for each service version.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+      - run: npm test
+
+  build-and-push:
+    name: Build & push Docker image
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Expects a kubeconfig stored as a repo secret (base64-encoded),
+      # pointing at your cluster (minikube, EKS, GKE, etc).
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > "$HOME/.kube/config"
+
+      - name: Select target namespace for this version
+        id: version
+        run: |
+          TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          case "$TAG" in
+            v1.0.*) echo "dir=k8s/v1" >> "$GITHUB_OUTPUT" ;;
+            v1.1.*) echo "dir=k8s/v1.1" >> "$GITHUB_OUTPUT" ;;
+            v2.*)   echo "dir=k8s/v2" >> "$GITHUB_OUTPUT" ;;
+            *)      echo "Unrecognized tag $TAG" && exit 1 ;;
+          esac
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -f ${{ steps.version.outputs.dir }}/namespace.yaml
+          kubectl apply -f ${{ steps.version.outputs.dir }}/deployment.yaml
+          kubectl apply -f ${{ steps.version.outputs.dir }}/service.yaml
+          kubectl apply -f ${{ steps.version.outputs.dir }}/hpa.yaml
+          kubectl apply -f k8s/ingress/ingress.yaml
+          kubectl apply -f k8s/rbac/rbac.yaml
+
+      - name: Set deployed image
+        run: |
+          TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          NS=$(echo "${{ steps.version.outputs.dir }}" | sed 's#k8s/##; s#\.#-#')
+          kubectl set image deployment/product-catalog \
+            product-catalog=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG} \
+            -n "catalog-${NS#v}" --record || true
+
+      - name: Wait for rollout
+        run: |
+          NS=$(echo "${{ steps.version.outputs.dir }}" | sed 's#k8s/##; s#\.#-#')
+          kubectl rollout status deployment/product-catalog -n "catalog-${NS#v}" --timeout=120s
+
+  integration-tests:
+    name: Post-deploy integration tests
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Smoke test the deployed endpoint
+        env:
+          BASE_URL: ${{ secrets.DEPLOYED_BASE_URL }}
+        run: |
+          curl -sf "$BASE_URL/health" | grep -q '"status":"ok"'
+          curl -sf "$BASE_URL/products" | grep -q '"products"'
